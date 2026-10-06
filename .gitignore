@@ -1,0 +1,9 @@
+bin/
+.DS_Store
+
+# Test program from Lunar; not ours to redistribute.
+/rockets
+/lunar-backend-engineer-challenge/
+
+# Failing inputs saved by rapid property tests.
+testdata/rapid/

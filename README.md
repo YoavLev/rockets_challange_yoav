@@ -1,12 +1,4 @@
-# Rockets
-
-A Go service that consumes rocket messages from Lunar's test program and serves each rocket's current state over a REST API. The challenge brief is in [docs/CHALLENGE.md](docs/CHALLENGE.md).
-
-Messages arrive out of order and may be duplicated. The core of the service is a small **per-rocket reorder buffer**: it applies each rocket's messages strictly in message-number order, exactly once, and holds early messages until the gap before them fills.
-
 ## Quick start
-
-Requirements: Go 1.25+, and the test program from the challenge ZIP copied to `./rockets` (or set `ROCKETS=path/to/rockets`).
 
 ```bash
 make run                                          # service on :8088
@@ -29,9 +21,17 @@ make e2e                              # the real test program, default settings,
 ./scripts/e2e.sh --max-messages=2000  # a quick e2e run (needs make build first)
 ```
 
-`make e2e` runs the service on port 8089 so it doesn't clash with `make run`. It fails if the test program logged any delivery error or any rocket still has messages pending, and prints the final state as a table.
+## Project layout
 
-While running, the service logs a `stats` line every 2 seconds (messages received, rockets, goroutines).
+```
+cmd/rockets-service/   main: flags, logging, graceful shutdown, stats
+internal/domain/       Rocket, the five message types, Apply, Stream (reorder buffer)
+internal/store/        in-memory store: Receive, Get, List with sorting
+internal/httpapi/      JSON decoding, routes, status codes
+scripts/e2e.sh         end-to-end test against the real test program
+PLAN.md                the plan and measurements this was built from
+CLAUDE.md              conventions for AI coding agents working in this repo
+```
 
 ## API
 
@@ -41,7 +41,7 @@ While running, the service logs a `stats` line every 2 seconds (messages receive
 | `GET /rockets/{channel}` | One rocket's state. `404` if the channel is unknown. |
 | `GET /rockets?sort=&order=` | All rockets. `sort`: `speed`, `mission`, `type`, `launchTime` (default: channel). `order`: `asc` (default) or `desc`. Ties are broken by channel, so the order is stable. An unknown value gives `400`. |
 
-A rocket looks like this:
+A rocket object:
 
 ```json
 {
@@ -83,8 +83,6 @@ rockets ──POST /messages──▶ internal/httpapi   decode JSON, routes, st
                             internal/domain    Rocket, Apply, Stream (the reorder buffer); no I/O
 ```
 
-Dependencies point inward: `domain` knows nothing about HTTP or storage, which keeps the hard part cheap to test.
-
 **Order by message number, not by time.** Each rocket's `Stream` keeps a counter of handled messages and a map of early ones. For incoming message *n*:
 
 1. *n* ≤ counter, or *n* already in the map: duplicate, drop it.
@@ -95,7 +93,7 @@ Dependencies point inward: `domain` knows nothing about HTTP or storage, which k
 
 ## Design decisions
 
-This is event sourcing in shape: applied as an ordered stream. the message number is the stream version, and a rocket's state is `Apply` folded over its stream. Copies are safe because `Rocket` holds only values and Stream.Rocket() returns it by value, so the store can hand out copies without sharing state.
+This is event sourcing in shape: applied as an ordered stream. the message number is the stream version, and a rocket's state is `Apply` folded over its stream. 
 
 ### Other decisions
 
@@ -105,9 +103,7 @@ This is event sourcing in shape: applied as an ordered stream. the message numbe
 | `Outcome.Recorded()` lives in the domain | Whether a message is safe is a domain fact; `httpapi` only maps it to `200` (recorded) or `503` (resend). A future outcome, such as "buffer full, retry later", is added in one place, `domain/stream.go`. Today every outcome is recorded, so `503` is never sent. |
 | One `sync.RWMutex` for the whole store | nowhere near a bottleneck at concurrency 3. Per-rocket locks are the next step if it becomes one. |
 | In-memory state | Durable storage is out of scope for the challenge; a restart loses state.|
-| No stored rocket status | The task doesn't ask for one, and it would duplicate `exploded` and `lastAppliedMessage`. |
 | Unknown JSON fields are ignored | Rejecting them would turn a new producer field into `400`s, and then an endless redelivery loop. |
-| Only the standard library | Plus [`rapid`](https://pkg.go.dev/pgregory.net/rapid) for the property test. |
 
 ### Edge cases
 
@@ -125,26 +121,10 @@ This is event sourcing in shape: applied as an ordered stream. the message numbe
 | Layer | What it proves |
 |---|---|
 | Table-driven tests for `Apply` and `Stream` (`internal/domain`) | Every message type; duplicates, buffering, draining, skipping an invalid message. |
-| Property test (`TestReceiveAnyDeliveryOrder`, with `rapid`) | For random streams, any shuffled order with random duplicates gives the same rocket as applying the stream in order. This is the main correctness argument. |
-| Concurrency test (`TestConcurrentReceive`, under `-race`) | 8 writers and a reader on 20 rockets, every message sent twice in random order: correct final state, no data races. |
+| Property test (`TestReceiveAnyDeliveryOrder`, with `rapid`) | For random streams, any shuffled order with random duplicates gives the same rocket as applying the stream in order.|
+| Concurrency test (`TestConcurrentReceive`, under `-race`) | 8 writers and a reader on 20 rockets,correct final state, no data races. |
 | HTTP tests (`internal/httpapi`, `httptest`) | Decoding and validation, status codes, and the exact response JSON, against the real store. |
 | End-to-end (`make e2e`) | The real test program at its default settings|
-
-The tests were also checked against deliberate bugs:
-- Removing the `delete` from the drain loop: the property test fails.
-- Removing the store lock: the race detector reports races, and the concurrency test crashes with Go's fatal concurrent map access error.
-
-## Project layout
-
-```
-cmd/rockets-service/   main: flags, logging, graceful shutdown, stats
-internal/domain/       Rocket, the five message types, Apply, Stream (reorder buffer)
-internal/store/        in-memory store: Receive, Get, List with sorting
-internal/httpapi/      JSON decoding, routes, status codes
-scripts/e2e.sh         end-to-end test against the real test program
-PLAN.md                the plan and measurements this was built from
-CLAUDE.md              conventions for AI coding agents working in this repo
-```
 
 ## Scaling and production
 
